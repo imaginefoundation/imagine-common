@@ -4,8 +4,7 @@
 #![no_std]
 #![no_main]
 
-const SYS_EXEC: u64 = 7;
-const SYS_WAITPID: u64 = 46;
+use dnu_abi::{SYS_EXEC, SYS_WAITPID};
 
 /// Faz spawn de um programa (SYS_EXEC) via syscall.
 fn spawn(path: &[u8]) -> i64 {

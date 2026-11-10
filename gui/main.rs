@@ -9,22 +9,12 @@ mod wm;
 
 use gdi::{HDC, Rect, COLOR_3DFACE, draw_cursor};
 use wm::WindowManager;
-
-const SYS_FB_INFO: u64 = 48;
-const SYS_FB_MAP: u64 = 49;
-const SYS_INPUT_POLL: u64 = 50;
-const SYS_CONSOLE_RELEASE: u64 = 51;
-const SYS_POINTER_POSITION: u64 = 52;
-const SYS_SURFACE_CREATE: u64 = 53;
-const SYS_SURFACE_PRESENT: u64 = 54;
-const SYS_SURFACE_FLUSH: u64 = 55;
-const SYS_SURFACE_DESTROY: u64 = 56;
-const SYS_SURFACE_POLL: u64 = 57;
-const SYS_SURFACE_SNAPSHOT: u64 = 58;
-const SYS_SURFACE_SEND_EVENT: u64 = 59;
-const SYS_SURFACE_MOVE: u64 = 61;
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 4;
+use dnu_abi::{SYS_FB_INFO, SYS_FB_MAP, SYS_INPUT_POLL, SYS_CONSOLE_RELEASE,
+              SYS_POINTER_POSITION, SYS_SURFACE_CREATE, SYS_SURFACE_PRESENT,
+              SYS_SURFACE_FLUSH, SYS_SURFACE_DESTROY, SYS_SURFACE_POLL,
+              SYS_SURFACE_SNAPSHOT, SYS_SURFACE_SEND_EVENT, SYS_SURFACE_MOVE,
+              SYS_WRITE, SYS_EXIT,
+              FramebufferInfo, InputEvent, SurfaceEvent};
 
 const INPUT_KEY: u32 = 1;
 const INPUT_MOUSE_MOVE: u32 = 2;
@@ -79,58 +69,24 @@ fn call_window_proc(hwnd: u32, msg: u32, w_param: usize, l_param: isize) -> isiz
     }
 }
 
-#[repr(C)]
-struct FramebufferInfo {
-    address: u64,
-    physical_address: u64,
-    width: u32,
-    height: u32,
-    pitch: u32,
-    red_shift: u8,
-    green_shift: u8,
-    blue_shift: u8,
-    reserved: u8,
-}
-
-#[repr(C)]
-struct InputEvent {
-    kind: u32,
-    key: u32,
-    x: i32,
-    y: i32,
-    button: u32,
-    pressed: u32,
-}
-
-#[repr(C)]
-struct SurfaceEvent {
-    surface: u32,
-    kind: u32,
-    x: i32,
-    y: i32,
-    button: u32,
-    pressed: u32,
-    key: u32,
-}
-
 fn syscall0(n: u64) -> u64 {
     let mut ret: u64;
-    unsafe { core::arch::asm!("int 0x80", in("rax") n, lateout("rax") ret, options(nostack, nomem)); ret }
+    unsafe { core::arch::asm!("syscall", in("rax") n, lateout("rax") ret, options(nostack, nomem)); ret }
 }
 
 fn syscall1(n: u64, a1: u64) -> u64 {
     let mut ret: u64;
-    unsafe { core::arch::asm!("int 0x80", in("rax") n, in("rdi") a1, lateout("rax") ret, options(nostack, nomem)); ret }
+    unsafe { core::arch::asm!("syscall", in("rax") n, in("rdi") a1, lateout("rax") ret, options(nostack, nomem)); ret }
 }
 
 fn syscall2(n: u64, a1: u64, a2: u64) -> u64 {
     let mut ret: u64;
-    unsafe { core::arch::asm!("int 0x80", in("rax") n, in("rdi") a1, in("rsi") a2, lateout("rax") ret, options(nostack, nomem)); ret }
+    unsafe { core::arch::asm!("syscall", in("rax") n, in("rdi") a1, in("rsi") a2, lateout("rax") ret, options(nostack, nomem)); ret }
 }
 
 fn console_write(bytes: &[u8]) {
     unsafe {
-        core::arch::asm!("int 0x80", in("rax") SYS_WRITE, in("rdi") bytes.as_ptr(), in("rsi") bytes.len(), options(nostack, nomem));
+        core::arch::asm!("syscall", in("rax") SYS_WRITE, in("rdi") bytes.as_ptr(), in("rsi") bytes.len(), options(nostack, nomem));
     }
 }
 
@@ -159,7 +115,7 @@ extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     console_write(b"\r\n");
     if ret != 0 {
         console_write(b"ws_server: falha ao obter info do framebuffer\n");
-        unsafe { core::arch::asm!("int 0x80", in("rax") SYS_EXIT, options(nostack, nomem)); }
+        unsafe { core::arch::asm!("syscall", in("rax") SYS_EXIT, options(nostack, nomem)); }
     }
 
     let width = fb_info.width;
@@ -178,14 +134,14 @@ extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let ret = syscall1(SYS_FB_MAP, &mut fb_map_info as *mut FramebufferInfo as u64);
     if ret != 0 {
         console_write(b"ws_server: falha ao mapear framebuffer\n");
-        unsafe { core::arch::asm!("int 0x80", in("rax") SYS_EXIT, options(nostack, nomem)); }
+        unsafe { core::arch::asm!("syscall", in("rax") SYS_EXIT, options(nostack, nomem)); }
     }
 
     let fb_addr = fb_map_info.address as *mut u32;
     let pitch_pixels = (pitch as usize) / 4;
 
     unsafe {
-        core::arch::asm!("int 0x80", in("rax") SYS_CONSOLE_RELEASE, options(nostack, nomem));
+        core::arch::asm!("syscall", in("rax") SYS_CONSOLE_RELEASE, options(nostack, nomem));
     }
 
     console_write(b"ws_server: console liberado, servidor de display ativo\n");

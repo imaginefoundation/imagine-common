@@ -3,13 +3,12 @@
 #![no_std]
 #![no_main]
 
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 4;
+use dnu_abi::{SYS_WRITE, SYS_EXIT};
 
 fn console_write(bytes: &[u8]) {
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             in("rax") SYS_WRITE,
             in("rdi") bytes.as_ptr(),
             in("rsi") bytes.len(),
