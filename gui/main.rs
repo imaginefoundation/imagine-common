@@ -71,22 +71,56 @@ fn call_window_proc(hwnd: u32, msg: u32, w_param: usize, l_param: isize) -> isiz
 
 fn syscall0(n: u64) -> u64 {
     let mut ret: u64;
-    unsafe { core::arch::asm!("syscall", in("rax") n, lateout("rax") ret, options(nostack, nomem)); ret }
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") n,
+            lateout("rax") ret,
+            options(nostack)
+        );
+    }
+    ret
 }
 
 fn syscall1(n: u64, a1: u64) -> u64 {
     let mut ret: u64;
-    unsafe { core::arch::asm!("syscall", in("rax") n, in("rdi") a1, lateout("rax") ret, options(nostack, nomem)); ret }
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") n,
+            in("rdi") a1,
+            lateout("rax") ret,
+            options(nostack)
+        );
+    }
+    ret
 }
 
 fn syscall2(n: u64, a1: u64, a2: u64) -> u64 {
     let mut ret: u64;
-    unsafe { core::arch::asm!("syscall", in("rax") n, in("rdi") a1, in("rsi") a2, lateout("rax") ret, options(nostack, nomem)); ret }
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") n,
+            in("rdi") a1,
+            in("rsi") a2,
+            lateout("rax") ret,
+            options(nostack)
+        );
+    }
+    ret
 }
 
 fn console_write(bytes: &[u8]) {
     unsafe {
-        core::arch::asm!("syscall", in("rax") SYS_WRITE, in("rdi") bytes.as_ptr(), in("rsi") bytes.len(), options(nostack, nomem));
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_WRITE,
+            in("rdi") bytes.as_ptr(),
+            in("rsi") bytes.len(),
+            lateout("rax") _,
+            options(nostack)
+        );
     }
 }
 
@@ -115,7 +149,7 @@ extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     console_write(b"\r\n");
     if ret != 0 {
         console_write(b"ws_server: falha ao obter info do framebuffer\n");
-        unsafe { core::arch::asm!("syscall", in("rax") SYS_EXIT, options(nostack, nomem)); }
+        unsafe { core::arch::asm!("syscall", in("rax") SYS_EXIT, in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64, in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, options(nostack, nomem)); }
     }
 
     let width = fb_info.width;
@@ -132,16 +166,22 @@ extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
 
     let mut fb_map_info = FramebufferInfo { address: 0, physical_address: fb_info.physical_address, width, height, pitch, red_shift: fb_info.red_shift, green_shift: fb_info.green_shift, blue_shift: fb_info.blue_shift, reserved: 0 };
     let ret = syscall1(SYS_FB_MAP, &mut fb_map_info as *mut FramebufferInfo as u64);
+    console_write(b"ws_server: fb_map ret=");
+    console_write_u32(ret as u32);
+    console_write(b"\r\n");
     if ret != 0 {
         console_write(b"ws_server: falha ao mapear framebuffer\n");
-        unsafe { core::arch::asm!("syscall", in("rax") SYS_EXIT, options(nostack, nomem)); }
+        unsafe { core::arch::asm!("syscall", in("rax") SYS_EXIT, in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64, in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, options(nostack, nomem)); }
     }
 
     let fb_addr = fb_map_info.address as *mut u32;
+    console_write(b"ws_server: fb_addr=0x");
+    console_write_u32(fb_map_info.address as u32);
+    console_write(b"\r\n");
     let pitch_pixels = (pitch as usize) / 4;
 
     unsafe {
-        core::arch::asm!("syscall", in("rax") SYS_CONSOLE_RELEASE, options(nostack, nomem));
+        core::arch::asm!("syscall", in("rax") SYS_CONSOLE_RELEASE, in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64, in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, options(nostack, nomem));
     }
 
     console_write(b"ws_server: console liberado, servidor de display ativo\n");
@@ -155,12 +195,17 @@ extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     console_write(b"ws_server: janelas iniciais criadas\n");
 
     loop {
+        console_write(b"ws_server: loop iteration\r\n");
+
         let mut ev = InputEvent { kind: 0, key: 0, x: 0, y: 0, button: 0, pressed: 0 };
         let ev_ptr = &mut ev as *mut InputEvent as u64;
 
         loop {
             let has = syscall1(SYS_INPUT_POLL, ev_ptr);
             if has == 0 { break; }
+            console_write(b"ws_server: input event kind=");
+            console_write_u32(ev.kind);
+            console_write(b"\r\n");
             match ev.kind {
                 INPUT_KEY => {
                     console_write(b"ws_server: tecla ");
@@ -193,6 +238,8 @@ extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
             }
         }
 
+        console_write(b"ws_server: after input poll\r\n");
+
         let pos = syscall0(SYS_POINTER_POSITION);
         let cursor_x = (pos >> 32) as u32 as i32;
         let cursor_y = pos as u32 as i32;
@@ -203,13 +250,25 @@ extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
             let sev_ptr = &mut sev as *mut SurfaceEvent as u64;
             let has = syscall1(SYS_SURFACE_POLL, sev_ptr);
             if has == 0 { break; }
+            console_write(b"ws_server: surface event surface=");
+            console_write_u32(sev.surface);
+            console_write(b" kind=");
+            console_write_u32(sev.kind);
+            console_write(b"\r\n");
             call_window_proc(sev.surface, sev.kind, sev.x as usize, sev.y as isize);
         }
 
+        console_write(b"ws_server: after surface poll\r\n");
+
         let bg_rect = Rect::new(0, 0, width as i32, height as i32);
         hdc.fill_rect(&bg_rect, COLOR_3DFACE);
+        console_write(b"ws_server: after fill_rect\r\n");
         wm.render(&mut hdc);
-        let _ = syscall2(SYS_SURFACE_PRESENT, 0, 1);
+        console_write(b"ws_server: after render\r\n");
+        let ret2 = syscall2(SYS_SURFACE_PRESENT, 0, 1);
+        console_write(b"ws_server: surface_present ret=");
+        console_write_u32(ret2 as u32);
+        console_write(b"\r\n");
 
         for _ in 0..50_000 {
             core::hint::spin_loop();

@@ -13,7 +13,11 @@ fn console_write(bytes: &[u8]) {
             in("rax") SYS_WRITE,
             in("rdi") bytes.as_ptr(),
             in("rsi") bytes.len(),
-            options(nostack)
+            in("rdx") 0u64,
+            in("r10") 0u64,
+            in("r8") 0u64,
+            in("r9") 0u64,
+            options(nostack, nomem)
         );
     }
 }
