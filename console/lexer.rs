@@ -1,386 +1,395 @@
-//! Tokenizador do shell.
+//! Tokenizador da sintaxe DSH (DotShell).
 //!
-//! Produz uma sequência de [`Word`]/operadores a partir de uma linha. O modelo
-//! segue o POSIX o suficiente para um shell de uso geral:
+//! Gramática simplificada (por linha):
+//!   stmt := '.' ident '(' args? ')' | '.' ident '(' args? ')' chain* | block
+//!   chain := '.' ident '(' args? ')'
+//!   args := arg (',' arg)*   onde arg := string | int | bool | ident | '-ident=arg' | 'ident=arg'
+//!   block := '{' stmt* '}'
 //!
-//! * *words* guardam os segmentos entre aspas para que a expansão de variáveis
-//!   saiba quando não expandir (aspas simples) e quando preservar espaços
-//!   (aspas duplas);
-//! * operadores (`|`, `&&`, `||`, `;`, `<`, `>`, `>>`, `&`) são tokens próprios;
-//! * `#` inicia comentário apenas quando começa uma word nova.
+//! Comentários começam em `#` e vão até o fim da linha.
 
-// Os tamanhos abaixo são deliberadamente modestos: as estruturas ficam na
-// pilha do processo dentro do shell, que tem apenas `USER_STACK_SIZE` (32 KiB).
-// Um comando com 8 palavras de até 48 bytes e 4 segmentos de aspas é mais que
-// suficiente para uso interativo, e mantém a pilha sob controle.
-pub const MAX_TOKENS: usize = 24;
-/// Bytes por segmento. 64 cobre caminhos e argumentos usuais (incluindo URLs e
-/// mensagens citadas); palavras maiores são recusadas com `WordTooLong` em vez
-/// de silenciosamente cortadas.
-pub const TOKEN_SIZE: usize = 64;
-/// Segmentos por word: um literal e uma parte citada bastam para os casos
-/// comuns (`prefix'quoted'`). Trechos mais fragmentados são combinados.
-pub const MAX_SEGMENTS: usize = 2;
-/// Aumentar `TOKEN_SIZE`/`MAX_SEGMENTS` também aumenta `Word`, `Command` e
-/// `Entry`, que vivem na pilha de 128 KiB do processo. Se o shell voltar a
-/// estourar a pilha, estes são os primeiros candidatos a reduzir.
+use core::fmt;
 
-/// Como um segmento deve ser tratado na expansão.
+/// Número máximo de tokens por linha.
+pub const MAX_TOKENS: usize = 96;
+/// Tamanho máximo do texto de um token (strings, identificadores).
+pub const TOKEN_TEXT: usize = 64;
+
+/// Tipo de token da linguagem DSH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SegmentKind {
-    /// Texto sem aspas: sofre split implícito por espaço e expansão.
-    Unquoted,
-    /// `'...'`: totalmente literal, sem qualquer expansão.
-    SingleQuoted,
-    /// `"..."`: expande `$VAR` mas não faz split nem interpreta `*`.
-    DoubleQuoted,
+pub enum TokenKind {
+    /// `.` prefixo de comando.
+    Dot,
+    /// Identificador (nome de comando, variável, módulo).
+    Ident,
+    /// Literal de string `"..."`.
+    String,
+    /// Inteiro.
+    Int,
+    /// Booleano `true` / `false`.
+    Bool,
+    /// `(`
+    LParen,
+    /// `)`
+    RParen,
+    /// `,` separador de argumentos.
+    Comma,
+    /// `=` (atribuição / argumento nomeado).
+    Eq,
+    /// `-` prefixo de flag.
+    Minus,
+    /// `{` abertura de bloco (função / corpo).
+    LBrace,
+    /// `}` fechamento de bloco.
+    RBrace,
+    /// Fim de linha / fim da entrada.
+    Newline,
+    /// Fim do arquivo/entrada.
+    Eof,
+    /// Erro léxico.
+    Error,
 }
 
-#[derive(Clone, Copy)]
-pub struct Segment {
-    pub bytes: [u8; TOKEN_SIZE],
-    pub length: u8,
-    pub kind: SegmentKind,
-    /// Contém um `$` não escapado que precisa ser expandido em runtime.
-    pub copies_variable: bool,
+/// Um único token com seu texto (quando aplicável) e tipo.
+#[derive(Clone, Copy, Debug)]
+pub struct Token {
+    pub kind: TokenKind,
+    /// Texto do token (para Ident, String, Int, Bool). Sem as aspas das strings.
+    pub text: [u8; TOKEN_TEXT],
+    pub text_len: usize,
+    /// Valor inteiro quando kind == Int.
+    pub int_value: i64,
+    /// Quando kind == Bool, o valor booleano.
+    pub bool_value: bool,
 }
 
-impl Segment {
-    pub const EMPTY: Self = Self {
-        bytes: [0; TOKEN_SIZE],
-        length: 0,
-        kind: SegmentKind::Unquoted,
-        copies_variable: false,
-    };
+impl Token {
+    pub const fn empty() -> Self {
+        Self {
+            kind: TokenKind::Eof,
+            text: [0; TOKEN_TEXT],
+            text_len: 0,
+            int_value: 0,
+            bool_value: false,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.text[..self.text_len]).unwrap_or("")
+    }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.length)]
+        &self.text[..self.text_len]
     }
 }
 
-/// Uma word é uma lista de segmentos que a expansão concatena.
-#[derive(Clone, Copy)]
-pub struct Word {
-    pub segments: [Segment; MAX_SEGMENTS],
-    pub segment_count: usize,
-}
-
-impl Word {
-    pub const EMPTY: Self = Self {
-        segments: [Segment::EMPTY; MAX_SEGMENTS],
-        segment_count: 0,
-    };
-
-    /// Devolve a word como fatia contígua quando ela já é literal.
-    ///
-    /// Útil para reconhecer opções como `-n` ou nomes como `cd` sem alocar um
-    /// buffer de expansão. `None` se houver variáveis ou mais de um segmento.
-    pub fn literal_bytes(&self) -> Option<&[u8]> {
-        if self.segment_count != 1 || self.segments[0].copies_variable {
-            return None;
-        }
-        Some(self.segments[0].as_bytes())
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.kind)
     }
 }
 
-/// Gramática linear do shell: só palavras e operadores.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Operator {
-    Pipe,
-    And,
-    Or,
-    Semicolon,
-    Background,
-    RedirectIn,
-    RedirectOut,
-    RedirectAppend,
+/// Resultado da tokenização de uma linha.
+pub struct LexResult {
+    pub count: usize,
 }
 
-#[derive(Clone, Copy)]
-pub enum Token {
-    Word(Word),
-    Operator(Operator),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LexError {
-    UnterminatedQuote,
-    TooManyTokens,
-    WordTooLong,
-}
-
-/// Tokeniza `line` para `tokens`, devolvendo quantos tokens foram produzidos.
+/// Tokeniza `line` para `tokens`. Devolve o número de tokens produzidos.
 ///
-/// Este lexer é deliberadamente independente da linha: `parse` pode então
-/// construir listas, pipelines e redirecionamentos sobre o vetor de tokens.
+/// Uma linha pode conter múltiplos statements separados por ponto-e-vírgula ou
+/// simplesmente por quebra de linha (o chamador alimenta uma linha por vez).
 pub fn tokenize(line: &[u8], tokens: &mut [Token; MAX_TOKENS]) -> Result<usize, LexError> {
     let mut count = 0usize;
     let mut position = 0usize;
 
     while position < line.len() {
         let byte = line[position];
-        // Espaço em branco separa words.
-        if byte == b' ' || byte == b'\t' {
+
+        // Espaços em branco e tab: ignorados.
+        if byte == b' ' || byte == b'\t' || byte == b'\r' {
             position += 1;
             continue;
         }
-        // Comentário: só quando começa uma word.
-        if byte == b'#' {
-            break;
-        }
 
-        if let Some((operator, width)) = operator_at(line, position) {
+        // Fim de linha: encerra o statement corrente.
+        if byte == b'\n' {
             if count == tokens.len() {
                 return Err(LexError::TooManyTokens);
             }
-            tokens[count] = Token::Operator(operator);
+            tokens[count] = Token { kind: TokenKind::Newline, ..Token::empty() };
             count += 1;
-            position += width;
+            position += 1;
             continue;
+        }
+
+        // Comentário até o fim da linha.
+        if byte == b'#' {
+            break;
         }
 
         if count == tokens.len() {
             return Err(LexError::TooManyTokens);
         }
-        let (word, next) = read_word(line, position)?;
-        tokens[count] = Token::Word(word);
-        count += 1;
-        position = next;
+
+        match byte {
+            b'.' => {
+                tokens[count] = Token { kind: TokenKind::Dot, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b'(' => {
+                tokens[count] = Token { kind: TokenKind::LParen, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b')' => {
+                tokens[count] = Token { kind: TokenKind::RParen, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b',' => {
+                tokens[count] = Token { kind: TokenKind::Comma, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b'=' => {
+                tokens[count] = Token { kind: TokenKind::Eq, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b'-' => {
+                tokens[count] = Token { kind: TokenKind::Minus, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b'{' => {
+                tokens[count] = Token { kind: TokenKind::LBrace, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b'}' => {
+                tokens[count] = Token { kind: TokenKind::RBrace, ..Token::empty() };
+                count += 1;
+                position += 1;
+            }
+            b'"' => {
+                // String literal com sequências de escape.
+                let (text, len, next) = read_string(line, position + 1)?;
+                if len > TOKEN_TEXT {
+                    return Err(LexError::StringTooLong);
+                }
+                let mut token = Token::empty();
+                token.kind = TokenKind::String;
+                token.text[..len].copy_from_slice(&text[..len]);
+                token.text_len = len;
+                tokens[count] = token;
+                count += 1;
+                position = next;
+            }
+            b'0'..=b'9' | b'+' | b'-' => {
+                // Inteiro (o '-' isolado já é Minus; aqui só aparece seguido de dígito).
+                let (digits, len, next, is_neg) = read_int(line, position);
+                if len > TOKEN_TEXT {
+                    return Err(LexError::NumberTooLong);
+                }
+                let mut token = Token::empty();
+                token.kind = TokenKind::Int;
+                token.text[..len].copy_from_slice(&digits[..len]);
+                token.text_len = len;
+                token.int_value = if is_neg { -(digits.iter().fold(0i64, |a, b| a * 10 + (*b - b'0') as i64)) } else {
+                    digits.iter().fold(0i64, |a, b| a * 10 + (*b - b'0') as i64)
+                };
+                tokens[count] = token;
+                count += 1;
+                position = next;
+            }
+            _ => {
+                // Identificador, palavra reservada, literal true/false, ou $var.
+                let (text, len, next) = read_ident(line, position);
+                if len > TOKEN_TEXT {
+                    return Err(LexError::IdentTooLong);
+                }
+                let mut token = Token::empty();
+                let lower = text.iter().take(len).collect::<Vec<_>>();
+                let is_bool = len == 4 && text[..4] == *b"true" || len == 5 && text[..5] == *b"false";
+                if is_bool {
+                    token.kind = TokenKind::Bool;
+                    token.bool_value = len == 4;
+                    token.text[..len].copy_from_slice(&text[..len]);
+                    token.text_len = len;
+                } else {
+                    token.kind = TokenKind::Ident;
+                    token.text[..len].copy_from_slice(&text[..len]);
+                    token.text_len = len;
+                }
+                tokens[count] = token;
+                count += 1;
+                position = next;
+            }
+        }
     }
 
     Ok(count)
 }
 
-fn operator_at(line: &[u8], position: usize) -> Option<(Operator, usize)> {
-    let rest = &line[position..];
-    // Operadores mais longos primeiro, para `>>` não virar `>` + `>`.
-    if rest.starts_with(b"&&") {
-        return Some((Operator::And, 2));
-    }
-    if rest.starts_with(b"||") {
-        return Some((Operator::Or, 2));
-    }
-    if rest.starts_with(b">>") {
-        return Some((Operator::RedirectAppend, 2));
-    }
-    match rest[0] {
-        b'|' => Some((Operator::Pipe, 1)),
-        b';' => Some((Operator::Semicolon, 1)),
-        b'&' => Some((Operator::Background, 1)),
-        b'<' => Some((Operator::RedirectIn, 1)),
-        b'>' => Some((Operator::RedirectOut, 1)),
-        _ => None,
-    }
-}
-
-/// Lê uma word a partir de `start`, acumulando segmentos conforme encontra
-/// aspas. Devolve a word e a posição seguinte (após o separador).
-fn read_word(line: &[u8], start: usize) -> Result<(Word, usize), LexError> {
-    let mut word = Word::EMPTY;
-    let mut position = start;
-
+/// Lê uma string entre aspas (posição já após o `"` abertura). Devolve
+/// (texto_expandido, comprimento, posição_após_aspas_fechamento).
+fn read_string(line: &[u8], mut position: usize) -> Result<([u8; TOKEN_TEXT], usize, usize), LexError> {
+    let mut text = [0u8; TOKEN_TEXT];
+    let mut length = 0usize;
     while position < line.len() {
         let byte = line[position];
-        if byte == b' ' || byte == b'\t' {
+        if byte == b'"' {
+            return Ok((text, length, position + 1));
+        }
+        if byte == b'\\' && position + 1 < line.len() {
+            let escaped = match line[position + 1] {
+                b'n' => b'\n',
+                b't' => b'\t',
+                b'\\' => b'\\',
+                b'"' => b'"',
+                other => other,
+            };
+            if length < TOKEN_TEXT {
+                text[length] = escaped;
+                length += 1;
+            }
+            position += 2;
+            continue;
+        }
+        if length < TOKEN_TEXT {
+            text[length] = byte;
+            length += 1;
+        }
+        position += 1;
+    }
+    Err(LexError::UnterminatedString)
+}
+
+/// Lê um inteiro começando em `position`. Devolve (dígitos, comprimento, próxima_posição, é_negativo).
+fn read_int(line: &[u8], position: usize) -> ([u8; TOKEN_TEXT], usize, usize, bool) {
+    let mut text = [0u8; TOKEN_TEXT];
+    let mut length = 0usize;
+    let mut start = position;
+    let mut is_neg = false;
+    if line[position] == b'-' {
+        is_neg = true;
+        start = position + 1;
+    } else if line[position] == b'+' {
+        start = position + 1;
+    }
+    let mut position = start;
+    while position < line.len() && line[position].is_ascii_digit() {
+        if length < TOKEN_TEXT {
+            text[length] = line[position];
+            length += 1;
+        }
+        position += 1;
+    }
+    (text, length, position, is_neg)
+}
+
+/// Lê um identificador (ou palavra-chave/true/false/$var) começando em `position`.
+fn read_ident(line: &[u8], position: usize) -> (&[u8], usize, usize) {
+    let mut start = position;
+    // Se começa com $, inclui o $ no identificador (ex.: $stdout, $?).
+    if line[position] == b'$' {
+        start = position;
+        position += 1;
+    }
+    while position < line.len() {
+        let byte = line[position];
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+            position += 1;
+        } else {
             break;
         }
-        if operator_at(line, position).is_some() {
-            break;
-        }
-
-        match byte {
-            b'\'' => {
-                position += 1;
-                let begin = position;
-                while position < line.len() && line[position] != b'\'' {
-                    position += 1;
-                }
-                if position == line.len() {
-                    return Err(LexError::UnterminatedQuote);
-                }
-                push_segment(
-                    &mut word,
-                    &line[begin..position],
-                    SegmentKind::SingleQuoted,
-                    false,
-                )?;
-                position += 1;
-            }
-            b'"' => {
-                position += 1;
-                let mut segment = Segment::EMPTY;
-                segment.kind = SegmentKind::DoubleQuoted;
-                while position < line.len() && line[position] != b'"' {
-                    let byte = line[position];
-                    // Dentro de aspas duplas só `\` escapa `"`, `\` e `$`.
-                    if byte == b'\\' && position + 1 < line.len() {
-                        let next = line[position + 1];
-                        if matches!(next, b'"' | b'\\' | b'$' | b'`') {
-                            push_byte(&mut segment, next)?;
-                            position += 2;
-                            continue;
-                        }
-                    }
-                    if byte == b'$' {
-                        segment.copies_variable = true;
-                    }
-                    push_byte(&mut segment, byte)?;
-                    position += 1;
-                }
-                if position == line.len() {
-                    return Err(LexError::UnterminatedQuote);
-                }
-                position += 1;
-                push_segment_direct(&mut word, segment)?;
-            }
-            b'\\' => {
-                position += 1;
-                if position == line.len() {
-                    return Err(LexError::UnterminatedQuote);
-                }
-                let escaped = [line[position]];
-                push_segment(&mut word, &escaped, SegmentKind::Unquoted, false)?;
-                position += 1;
-            }
-            _ => {
-                let begin = position;
-                let mut copies_variable = false;
-                while position < line.len() {
-                    let byte = line[position];
-                    if byte == b' '
-                        || byte == b'\t'
-                        || byte == b'\''
-                        || byte == b'"'
-                        || byte == b'\\'
-                        || operator_at(line, position).is_some()
-                    {
-                        break;
-                    }
-                    if byte == b'$' {
-                        copies_variable = true;
-                    }
-                    position += 1;
-                }
-                push_segment(
-                    &mut word,
-                    &line[begin..position],
-                    SegmentKind::Unquoted,
-                    copies_variable,
-                )?;
-            }
-        }
     }
-
-    if word.segment_count == 0 {
-        return Err(LexError::WordTooLong);
-    }
-    Ok((word, position))
+    (&line[start..position], position - start, position)
 }
 
-fn push_segment(
-    word: &mut Word,
-    bytes: &[u8],
-    kind: SegmentKind,
-    copies_variable: bool,
-) -> Result<(), LexError> {
-    let mut segment = Segment::EMPTY;
-    segment.kind = kind;
-    segment.copies_variable = copies_variable;
-    for &byte in bytes {
-        push_byte(&mut segment, byte)?;
-    }
-    push_segment_direct(word, segment)
-}
-
-fn push_segment_direct(word: &mut Word, segment: Segment) -> Result<(), LexError> {
-    if word.segment_count == MAX_SEGMENTS {
-        return Err(LexError::WordTooLong);
-    }
-    word.segments[word.segment_count] = segment;
-    word.segment_count += 1;
-    Ok(())
-}
-
-fn push_byte(segment: &mut Segment, byte: u8) -> Result<(), LexError> {
-    let length = usize::from(segment.length);
-    if length == segment.bytes.len() {
-        return Err(LexError::WordTooLong);
-    }
-    segment.bytes[length] = byte;
-    segment.length += 1;
-    Ok(())
+/// Erros léxicos.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LexError {
+    TooManyTokens,
+    UnterminatedString,
+    StringTooLong,
+    NumberTooLong,
+    IdentTooLong,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lex(line: &str) -> (usize, [Token; MAX_TOKENS]) {
-        let mut tokens = [Token::Word(Word::EMPTY); MAX_TOKENS];
-        let count = tokenize(line.as_bytes(), &mut tokens).expect("tokenize");
-        (count, tokens)
+    fn lex(input: &str) -> Vec<Token> {
+        let mut tokens = [Token::empty(); MAX_TOKENS];
+        let count = tokenize(input.as_bytes(), &mut tokens).expect("tokenize");
+        tokens[..count].to_vec()
     }
 
     #[test]
-    fn splits_words_and_operators() {
-        // ls  -la  |  grep  txt  >  out   => 7 tokens
-        let (count, tokens) = lex("ls -la | grep txt > out");
-        assert_eq!(count, 7);
-        assert!(matches!(tokens[0], Token::Word(_)));
-        assert!(matches!(tokens[2], Token::Operator(Operator::Pipe)));
-        assert!(matches!(tokens[5], Token::Operator(Operator::RedirectOut)));
+    fn simple_command() {
+        let tokens = lex(r#".run("ls")"#);
+        assert_eq!(tokens[0].kind, TokenKind::Dot);
+        assert_eq!(tokens[1].as_str(), "run");
+        assert_eq!(tokens[2].kind, TokenKind::LParen);
+        assert_eq!(tokens[3].as_str(), "ls");
+        assert_eq!(tokens[4].kind, TokenKind::RParen);
     }
 
     #[test]
-    fn recognises_double_character_operators() {
-        let (count, tokens) = lex("a && b || c >> d");
-        assert_eq!(count, 7);
-        assert!(matches!(tokens[1], Token::Operator(Operator::And)));
-        assert!(matches!(tokens[3], Token::Operator(Operator::Or)));
-        assert!(matches!(
-            tokens[5],
-            Token::Operator(Operator::RedirectAppend)
-        ));
+    fn chained_commands() {
+        let tokens = lex(r#".from("cow").run("moo")"#);
+        assert_eq!(tokens[0].kind, TokenKind::Dot);
+        assert_eq!(tokens[1].as_str(), "from");
+        assert_eq!(tokens[3].as_str(), "cow");
+        assert_eq!(tokens[5].kind, TokenKind::Dot);
+        assert_eq!(tokens[6].as_str(), "run");
+        assert_eq!(tokens[8].as_str(), "moo");
     }
 
     #[test]
-    fn quotes_are_tracked_per_segment() {
-        let (_, tokens) = lex("echo a'b c' \"e f\"");
-        // a'b c' -> 2 segmentos: literal "a" + citado "b c".
-        let Token::Word(word) = tokens[1] else { panic!("word") };
-        assert_eq!(word.segment_count, 2);
-        assert_eq!(word.segments[0].kind, SegmentKind::Unquoted);
-        assert_eq!(word.segments[1].kind, SegmentKind::SingleQuoted);
-        // "e f" -> um único segmento com aspas duplas.
-        let Token::Word(word) = tokens[2] else { panic!("word") };
-        assert_eq!(word.segments[0].kind, SegmentKind::DoubleQuoted);
+    fn named_args_and_flags() {
+        let tokens = lex(r#".args(owner="root").flags(-sound="moo")"#);
+        assert_eq!(tokens[1].as_str(), "args");
+        assert_eq!(tokens[3].as_str(), "owner");
+        assert_eq!(tokens[4].kind, TokenKind::Eq);
+        assert_eq!(tokens[5].as_str(), "root");
+        assert_eq!(tokens[7].as_str(), "flags");
+        assert_eq!(tokens[9].kind, TokenKind::Minus);
+        assert_eq!(tokens[10].as_str(), "sound");
+        assert_eq!(tokens[12].as_str(), "moo");
     }
 
     #[test]
-    fn unquoted_dollar_marks_expansion() {
-        let (_, tokens) = lex("echo $HOME '$HOME'");
-        let Token::Word(word) = tokens[1] else {
-            panic!("word")
-        };
-        assert!(word.segments[0].copies_variable);
-        let Token::Word(word) = tokens[2] else {
-            panic!("word")
-        };
-        assert!(!word.segments[0].copies_variable);
+    fn string_escapes() {
+        let tokens = lex(r#"."a\nb\tc""#);
+        assert_eq!(tokens[1].as_str(), "run");
+        let str_tok = &tokens[3];
+        assert_eq!(str_tok.kind, TokenKind::String);
+        assert_eq!(str_tok.as_str(), "a\nb\tc");
     }
 
     #[test]
-    fn comments_and_blank_lines_are_ignored() {
-        let (count, _) = lex("   # just a comment");
-        assert_eq!(count, 0);
+    fn booleans_and_ints() {
+        let tokens = lex(".loop(3).if(true)");
+        assert_eq!(tokens[3].kind, TokenKind::Int);
+        assert_eq!(tokens[3].int_value, 3);
+        assert_eq!(tokens[7].kind, TokenKind::Bool);
+        assert!(tokens[7].bool_value);
     }
 
     #[test]
-    fn unterminated_quote_is_reported() {
-        let mut tokens = [Token::Word(Word::EMPTY); MAX_TOKENS];
-        assert_eq!(
-            tokenize(b"echo \"open", &mut tokens),
-            Err(LexError::UnterminatedQuote)
-        );
+    fn comments_are_ignored() {
+        let tokens = lex("# comentario\n.run(\"x\")");
+        // A linha do comentário não produz tokens; a segunda linha sim.
+        let mut found_run = false;
+        for token in &tokens {
+            if token.as_str() == "run" {
+                found_run = true;
+            }
+        }
+        assert!(found_run);
     }
 }

@@ -1,11 +1,19 @@
-//! Tabela de variáveis de ambiente do shell.
+//! Tabela de variáveis com escopos aninhados.
 //!
-//! Um array fixo de `Variable`, no mesmo espírito do resto do userspace: sem
-//! alocador, com atualização no lugar. A tabela guarda tanto as variáveis
-//! exportadas (que vão para `envp` dos filhos) quanto `$?` e `$0`.
+//! Suporta `.var()` (declara no escopo atual), `.setvar()` (atualiza no escopo
+//! mais próximo onde existe), `.scope()` (abre novo nível) e `.endscope()`
+//! (fecha o nível). A resolução busca do escopo mais interno para o externo,
+//! então escopos internos sombreiam variáveis externas com o mesmo nome.
 
-pub const MAX_VARIABLES: usize = 24;
+use crate::lexer::Word;
+
+/// Número máximo de escopos simultâneos (pilha de escopo).
+pub const MAX_SCOPES: usize = 8;
+/// Número máximo de variáveis por escopo.
+pub const MAX_VARS_PER_SCOPE: usize = 16;
+/// Tamanho máximo do nome de uma variável.
 pub const NAME_SIZE: usize = 24;
+/// Tamanho máximo do valor de uma variável.
 pub const VALUE_SIZE: usize = 96;
 
 #[derive(Clone, Copy)]
@@ -15,76 +23,29 @@ pub struct Variable {
     pub value: [u8; VALUE_SIZE],
     pub value_length: usize,
     pub active: bool,
-    /// Exportada para o ambiente dos processos filhos.
-    pub exported: bool,
 }
 
 impl Variable {
-    const EMPTY: Self = Self {
+    pub const EMPTY: Self = Self {
         name: [0; NAME_SIZE],
         name_length: 0,
         value: [0; VALUE_SIZE],
         value_length: 0,
         active: false,
-        exported: false,
     };
 }
 
-/// Tamanho de um par `NAME=VALUE`, incluindo o `=` e o terminador implícito.
-pub const PAIR_SIZE: usize = NAME_SIZE + VALUE_SIZE + 1;
-
-/// Texto `NAME=VALUE` de uma variável exportada, materializado pelo chamador.
-///
-/// Reutilizável: cada `spawn` escreve nesta estrutura e depois a usa como
-/// `envp`. Manter os buffers fora de [`Environment`] evita auto-referência
-/// (um campo do struct tomando emprestado outro), que o `no_std` não permite
-/// expressar de forma limpa.
-pub struct EnvironmentPairs {
-    storage: [[u8; PAIR_SIZE]; MAX_VARIABLES],
-    lengths: [usize; MAX_VARIABLES],
-    count: usize,
+/// Um escopo: array fixo de variáveis.
+#[derive(Clone, Copy)]
+pub struct Scope {
+    variables: [Variable; MAX_VARS_PER_SCOPE],
 }
 
-impl EnvironmentPairs {
+impl Scope {
     pub const fn new() -> Self {
         Self {
-            storage: [[0; PAIR_SIZE]; MAX_VARIABLES],
-            lengths: [0; MAX_VARIABLES],
-            count: 0,
+            variables: [Variable::EMPTY; MAX_VARS_PER_SCOPE],
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    /// Empresta os pares prontos como `&str`, para uso direto em `envp`.
-    pub fn as_strs<'b>(&'b self) -> [&'b str; MAX_VARIABLES] {
-        let mut texts = [""; MAX_VARIABLES];
-        for index in 0..self.count {
-            texts[index] =
-                core::str::from_utf8(&self.storage[index][..self.lengths[index]]).unwrap_or("");
-        }
-        texts
-    }
-}
-
-/// A tabela de variáveis, com acesso auxiliar por nome.
-pub struct Environment {
-    variables: [Variable; MAX_VARIABLES],
-}
-
-impl Environment {
-    pub fn new() -> Self {
-        let mut environment = Self {
-            variables: [Variable::EMPTY; MAX_VARIABLES],
-        };
-        environment.set(b"HOME", b"/home", true);
-        environment.set(b"PATH", b"/bin", true);
-        environment.set(b"PWD", b"/", true);
-        environment.set(b"SHELL", b"/bin/shell", true);
-        environment.set(b"?", b"0", false);
-        environment
     }
 
     pub fn get(&self, name: &[u8]) -> Option<&[u8]> {
@@ -94,8 +55,10 @@ impl Environment {
             .map(|variable| &variable.value[..variable.value_length])
     }
 
-    pub fn set(&mut self, name: &[u8], value: &[u8], exported: bool) -> bool {
-        if !valid_name(name) || name.len() > NAME_SIZE || value.len() > VALUE_SIZE {
+    /// Define ou cria a variável neste escopo. Devolve falso se não houver
+    /// espaço ou o nome/valor for inválido ou muito longo.
+    pub fn set(&mut self, name: &[u8], value: &[u8]) -> bool {
+        if !valid_name(name) || name.is_empty() || name.len() > NAME_SIZE || value.len() > VALUE_SIZE {
             return false;
         }
         let slot = self
@@ -107,25 +70,12 @@ impl Environment {
             return false;
         };
         let variable = &mut self.variables[slot];
-        *variable = Variable::EMPTY;
         variable.name[..name.len()].copy_from_slice(name);
         variable.value[..value.len()].copy_from_slice(value);
         variable.name_length = name.len();
         variable.value_length = value.len();
         variable.active = true;
-        variable.exported = exported;
         true
-    }
-
-    /// Atualiza `$?` com o código de saída do último comando.
-    ///
-    /// O valor é truncado a 8 bits como no POSIX: um processo que retorna 256
-    /// aparece como 0 para o shell.
-    pub fn set_status(&mut self, status: i64) {
-        let mut buffer = [0u8; 24];
-        let byte = status as u8;
-        let length = format_decimal(u64::from(byte), &mut buffer);
-        let _ = self.set(b"?", &buffer[..length], true);
     }
 
     pub fn unset(&mut self, name: &[u8]) {
@@ -137,39 +87,108 @@ impl Environment {
             *variable = Variable::EMPTY;
         }
     }
+}
 
-    pub fn iter_exported(&self) -> impl Iterator<Item = &Variable> {
-        self.variables
-            .iter()
-            .filter(|variable| variable.active && variable.exported)
+/// Ambiente com pilha de escopos. O escopo 0 é o global (sempre presente).
+pub struct Environment {
+    scopes: [Scope; MAX_SCOPES],
+    scope_count: usize,
+}
+
+impl Environment {
+    pub fn new() -> Self {
+        let mut environment = Self {
+            scopes: [Scope::new(); MAX_SCOPES],
+            scope_count: 1,
+        };
+        // Variáveis globais iniciais (implícitas do DSH).
+        environment.scopes[0].set(b"HOME", b"/", true);
+        environment.scopes[0].set(b"PATH", b"/bin", true);
+        environment.scopes[0].set(b"PWD", b"/", true);
+        environment.scopes[0].set(b"SHELL", b"/bin/shell", true);
+        environment.scopes[0].set(b"?", b"0", true);
+        environment.scopes[0].set(b"stdout", b"", true);
+        environment
     }
 
-    /// Materializa as variáveis exportadas em `NAME=VALUE` dentro de `pairs`.
-    pub fn fill_pairs(&self, pairs: &mut EnvironmentPairs) {
-        let mut count = 0usize;
-        for variable in self.iter_exported() {
-            if count == MAX_VARIABLES {
-                break;
-            }
-            let name_end = variable.name_length;
-            let value_end = name_end + 1 + variable.value_length;
-            if value_end > PAIR_SIZE {
-                continue;
-            }
-            let pair = &mut pairs.storage[count];
-            pair[..name_end].copy_from_slice(&variable.name[..name_end]);
-            pair[name_end] = b'=';
-            pair[name_end + 1..value_end].copy_from_slice(&variable.value[..variable.value_length]);
-            pairs.lengths[count] = value_end;
-            count += 1;
+    /// Número de escopos ativos.
+    pub fn depth(&self) -> usize {
+        self.scope_count
+    }
+
+    /// Abre um novo escopo. Devolve falso se já estiver no limite.
+    pub fn push_scope(&mut self) -> bool {
+        if self.scope_count == MAX_SCOPES {
+            return false;
         }
-        pairs.count = count;
+        self.scope_count += 1;
+        true
+    }
+
+    /// Fecha o escopo mais interno (não fecha o global). Devolve falso se não
+    /// houver escopo para fechar.
+    pub fn pop_scope(&mut self) -> bool {
+        if self.scope_count <= 1 {
+            return false;
+        }
+        self.scope_count -= 1;
+        true
+    }
+
+    /// Resolve uma variável buscando do escopo mais interno para o externo.
+    pub fn get(&self, name: &[u8]) -> Option<&[u8]> {
+        let mut index = self.scope_count;
+        while index > 0 {
+            index -= 1;
+            if let Some(value) = self.scopes[index].get(name) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Declara (ou atualiza se já existir no escopo atual) uma variável no
+    /// escopo mais interno. Usado por `.var()`.
+    pub fn set_current(&mut self, name: &[u8], value: &[u8]) -> bool {
+        self.scopes[self.scope_count - 1].set(name, value)
+    }
+
+    /// Atualiza uma variável existente no escopo mais próximo onde ela está
+    /// definida. Se não existir em nenhum escopo, cria no escopo atual.
+    /// Usado por `.setvar()`.
+    pub fn setvar(&mut self, name: &[u8], value: &[u8]) -> bool {
+        let mut index = self.scope_count;
+        while index > 0 {
+            index -= 1;
+            if self.scopes[index].get(name).is_some() {
+                return self.scopes[index].set(name, value);
+            }
+        }
+        self.scopes[self.scope_count - 1].set(name, value)
+    }
+
+    /// Remove uma variável do escopo onde ela foi definida primeiro.
+    pub fn unset(&mut self, name: &[u8]) {
+        let mut index = self.scope_count;
+        while index > 0 {
+            index -= 1;
+            if self.scopes[index].get(name).is_some() {
+                self.scopes[index].unset(name);
+                return;
+            }
+        }
+    }
+
+    /// Retorna uma referência ao escopo atual (para leitura direta em expande).
+    pub fn current_scope(&self) -> &Scope {
+        &self.scopes[self.scope_count - 1]
     }
 }
 
+/// Valida o nome de uma variável (letra ou _ no início, depois alfanuméricos/_).
 pub fn valid_name(name: &[u8]) -> bool {
     match name.first() {
-        Some(first) if first.is_ascii_alphabetic() || *first == b'_' || *first == b'?' => {}
+        Some(first) if first.is_ascii_alphabetic() || *first == b'_' => {}
         _ => return false,
     }
     name[1..]
@@ -177,21 +196,84 @@ pub fn valid_name(name: &[u8]) -> bool {
         .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
-fn format_decimal(mut value: u64, output: &mut [u8; 24]) -> usize {
-    let mut digits = [0u8; 20];
-    let mut cursor = digits.len();
-    if value == 0 {
-        output[0] = b'0';
-        return 1;
+/// Expande uma `Word` (token) substituindo variáveis `$nome` e `${nome}`.
+/// Devolve o texto expandido ou None se a word não for literal simples.
+pub fn expand_word(word: &Word, environment: &Environment, output: &mut [u8; 256]) -> Option<usize> {
+    let mut length = 0usize;
+    for segment in word.segments[..word.segment_count].iter() {
+        let bytes = segment.as_bytes();
+        if segment.copies_variable {
+            expand_segment(segment, environment, output, &mut length)?;
+        } else {
+            if length + bytes.len() > output.len() {
+                return None;
+            }
+            output[length..length + bytes.len()].copy_from_slice(bytes);
+            length += bytes.len();
+        }
     }
-    while value != 0 {
-        cursor -= 1;
-        digits[cursor] = b'0' + (value % 10) as u8;
-        value /= 10;
+    Some(length)
+}
+
+fn expand_segment(
+    segment: &lexer::Segment,
+    environment: &Environment,
+    output: &mut [u8; 256],
+    length: &mut usize,
+) -> Option<()> {
+    let bytes = segment.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            if *length >= output.len() {
+                return None;
+            }
+            output[*length] = bytes[index];
+            *length += 1;
+            index += 1;
+            continue;
+        }
+        let (name, next) = parse_reference(bytes, index + 1);
+        if name.is_empty() {
+            if *length >= output.len() {
+                return None;
+            }
+            output[*length] = b'$';
+            *length += 1;
+            index += 1;
+            continue;
+        }
+        let value = environment.get(name).unwrap_or(b"");
+        for &byte in value {
+            if *length >= output.len() {
+                return None;
+            }
+            output[*length] = byte;
+            *length += 1;
+        }
+        index = next;
     }
-    let length = digits.len() - cursor;
-    output[..length].copy_from_slice(&digits[cursor..]);
-    length
+    Some(())
+}
+
+/// Lê o nome da variável após `$`, aceitando `${nome}`.
+fn parse_reference(bytes: &[u8], start: usize) -> (&[u8], usize) {
+    if bytes.get(start) == Some(&b'{') {
+        let name_start = start + 1;
+        if let Some(end) = bytes[name_start..].iter().position(|byte| *byte == b'}') {
+            let end = name_start + end;
+            return (&bytes[name_start..end], end + 1);
+        }
+        return (&[], start);
+    }
+    if matches!(bytes.get(start), Some(b'?') | Some(b'$')) {
+        return (&bytes[start..start + 1], start + 1);
+    }
+    let mut end = start;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+    (&bytes[start..end], end)
 }
 
 #[cfg(test)]
@@ -199,32 +281,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sets_gets_and_unsets() {
-        let mut environment = Environment::new();
-        assert_eq!(environment.get(b"PATH"), Some(&b"/bin"[..]));
-        assert!(environment.set(b"FOO", b"bar", true));
-        assert_eq!(environment.get(b"FOO"), Some(&b"bar"[..]));
-        environment.unset(b"FOO");
-        assert_eq!(environment.get(b"FOO"), None);
+    fn scoped_lookup_shadows_outer() {
+        let mut env = Environment::new();
+        env.scopes[0].set(b"x", b"1").unwrap();
+        assert_eq!(env.get(b"x"), Some(&b"1"[..]));
+        env.push_scope().unwrap();
+        env.scopes[1].set(b"x", b"2").unwrap();
+        assert_eq!(env.get(b"x"), Some(&b"2"[..]));
+        env.pop_scope().unwrap();
+        assert_eq!(env.get(b"x"), Some(&b"1"[..]));
     }
 
     #[test]
-    fn rejects_invalid_names() {
-        let mut environment = Environment::new();
-        assert!(!environment.set(b"1BAD", b"x", true));
-        assert!(!environment.set(b"", b"x", true));
-        assert!(!environment.set(&[b'a'; NAME_SIZE + 1], b"x", true));
+    fn setvar_updates_nearest_scope() {
+        let mut env = Environment::new();
+        env.push_scope().unwrap();
+        env.scopes[1].set(b"x", b"1").unwrap();
+        assert!(env.setvar(b"x", b"9"));
+        assert_eq!(env.scopes[1].get(b"x"), Some(&b"9"[..]));
+        env.pop_scope().unwrap();
     }
 
     #[test]
-    fn only_exported_variables_become_envp_pairs() {
-        let mut environment = Environment::new();
-        environment.set(b"SECRET", b"x", false);
-        let mut pairs = EnvironmentPairs::new();
-        environment.fill_pairs(&mut pairs);
-        let texts = pairs.as_strs();
-        let ready = &texts[..pairs.len()];
-        assert!(ready.iter().any(|pair| pair.starts_with("PATH=")));
-        assert!(!ready.iter().any(|pair| pair.starts_with("SECRET=")));
+    fn cannot_pop_global_scope() {
+        let mut env = Environment::new();
+        assert!(!env.pop_scope());
+        assert_eq!(env.depth(), 1);
     }
 }

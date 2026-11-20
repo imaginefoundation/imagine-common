@@ -1,0 +1,20 @@
+# ==============================================================================
+# imagine-common — workspace de programas do userspace (submódulo independente)
+# ==============================================================================
+#
+# Projeto Cargo independente, ao lado do kernel DNU (`dnu/`). Não faz parte do
+# workspace da raiz do ImagineOS; cada submódulo gere o seu próprio build.
+
+[workspace]
+members = [
+    "illusion", "intellect", "brainit", "utils",
+]
+resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

@@ -1,312 +1,479 @@
-//! Parser do shell.
+//! Parser da sintaxe DSH.
 //!
-//! Reescreve o vetor de tokens do lexer em estruturas executáveis, uma *lista*
-//! por vez. A gramática suportada:
-//!
-//! ```text
-//! list      := pipeline ( (';' | '&&' | '||' | '&') pipeline )*
-//! pipeline  := command ( '|' command )*
-//! command   := word+ redirect*
-//! redirect  := ('<' | '>' | '>>') word
-//! ```
-//!
-//! Controle de fluxo (`if`/`for`/`while`) é reconhecido na primeira palavra de
-//! um comando; o parser marca esses comandos como [`CommandKind::Keyword`] para
-//! que o executor aplique a gramática composta, evitando misturar as duas
-//! responsabilidades aqui.
+//! Transforma os tokens do lexer em uma sequência de comandos executáveis,
+//! respeitando a cadeia ponto-notação (`.run("x").args(...)`), blocos de função
+//! (`{ ... }`) e estruturas de controle (`.if`/`.else`/`.endif`, `.loop`,
+//! `.scope`/`.endscope`, `.function`).
 
-use crate::lexer::{Operator, Token, Word};
+use crate::lexer::{LexError, Token, TokenKind};
 
-/// Tamanho máximo de um pipeline (número de estágios).
-pub const MAX_PIPELINE: usize = 3;
-/// Palavras por comando (inclui o nome do programa).
-pub const MAX_WORDS: usize = 6;
-/// Entradas (pipelines) por linha: permite `a; b; c; d` e alguns `&&`/`||`.
-pub const MAX_ENTRIES: usize = 6;
+// ---------------------------------------------------------------------------
+// Nós da árvore de execução linear
+// ---------------------------------------------------------------------------
 
-/// Um único comando: palavras e redirecionamentos.
-#[derive(Clone, Copy)]
-pub struct Command {
-    pub words: [Word; MAX_WORDS],
-    pub word_count: usize,
-    pub stdin: Option<Word>,
-    pub stdout: Option<Word>,
-    pub append: bool,
-}
-
-impl Command {
-    pub const EMPTY: Self = Self {
-        words: [Word::EMPTY; MAX_WORDS],
-        word_count: 0,
-        stdin: None,
-        stdout: None,
-        append: false,
-    };
-}
-
-/// Um pipeline é uma cadeia de comandos unidos por `|`.
-#[derive(Clone, Copy)]
-pub struct Pipeline {
-    pub commands: [Command; MAX_PIPELINE],
-    pub command_count: usize,
-}
-
-impl Pipeline {
-    pub const EMPTY: Self = Self {
-        commands: [Command::EMPTY; MAX_PIPELINE],
-        command_count: 0,
-    };
-}
-
-/// Operador que liga este pipeline ao próximo.
+/// Um comando DSH: um encadeamento de chamadas `.nome(...)` seguido de seus
+/// argumentos. Cada item da cadeia é um `ChainItem`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Connector {
-    /// `;` — executa o seguinte de qualquer forma.
-    Always,
-    /// `&&` — só se o anterior teve sucesso.
-    OnSuccess,
-    /// `||` — só se o anterior falhou.
-    OnFailure,
-    /// `&` — não espera o término.
-    Background,
-    /// Fim da entrada.
-    End,
+pub enum ChainItemKind {
+    Run,      // .run("programa")
+    From,     // .from("comando")
+    Args,     // .args(chave="valor", ...)
+    Flags,    // .flags(-chave="valor", ...)
+    Loop,     // .loop(n)
+    If,       // .if(condicao)
+    Else,     // .else()
+    EndIf,    // .endif()
+    Scope,    // .scope()
+    EndScope, // .endscope()
+    Function, // .function(nome)
+    Import,   // .import("modulo")
+    Pipe,     // .pipe("programa")
+    Var,      // .var(nome = valor)
+    SetVar,   // .setvar(nome = valor)
 }
 
-#[derive(Clone, Copy)]
-pub struct Entry {
-    pub pipeline: Pipeline,
-    /// Operador lido *após* este pipeline, que decide o próximo.
-    pub connector: Connector,
+/// Um item de cadeia `.nome(...)` com seus argumentos brutos (textos).
+#[derive(Clone, Copy, Debug)]
+pub struct ChainItem {
+    pub kind: ChainItemKind,
+    /// Posição do primeiro argumento dentro de `args_buffer` (índice em args).
+    pub arg_start: usize,
+    /// Quantidade de argumentos deste item.
+    pub arg_count: usize,
 }
 
+/// Um argumento é um literal (string/int/bool/ident) ou um par nomeado
+/// (`nome=valor`) ou uma flag (`-nome=valor`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arg {
+    Positional { text: [u8; crate::lexer::TOKEN_TEXT], len: usize },
+    Named { name: [u8; crate::lexer::TOKEN_TEXT], name_len: usize, value: [u8; crate::lexer::TOKEN_TEXT], value_len: usize },
+    Flag { name: [u8; crate::lexer::TOKEN_TEXT], name_len: usize, value: [u8; crate::lexer::TOKEN_TEXT], value_len: usize },
+}
+
+/// Um statement (uma linha ou bloco completo) do programa.
+#[derive(Clone, Copy, Debug)]
+pub enum Stmt {
+    /// Um encadeamento `.run("x").args(...)` (ou outros built-ins).
+    Chain { items: [ChainItem; 8], item_count: usize },
+    /// Bloco de função `.function(nome) { ... }` seguido do corpo (índices no
+    /// programa). Não usado diretamente aqui; mantido para expansão futura.
+    Function { name: [u8; crate::lexer::TOKEN_TEXT], name_len: usize, body_start: usize, body_end: usize },
+}
+
+/// Programa completo: sequência de statements.
+pub struct Program {
+    pub stmts: [Stmt; 64],
+    pub stmt_count: usize,
+    /// Buffer de argumentos (textos) compartilhado por todos os itens.
+    pub args: [[u8; crate::lexer::TOKEN_TEXT]; 128],
+    pub args_len: [usize; 128],
+    pub arg_count: usize,
+}
+
+impl Program {
+    pub const fn new() -> Self {
+        Self {
+            stmts: [Stmt::Chain { items: [ChainItem { kind: ChainItemKind::Run, arg_start: 0, arg_count: 0 }; 8], item_count: 0 }; 64],
+            stmt_count: 0,
+            args: [[0; crate::lexer::TOKEN_TEXT]; 128],
+            args_len: [0; 128],
+            arg_count: 0,
+        }
+    }
+}
+
+/// Erros de parse.
+#[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
-    /// Um operador apareceu onde se esperava um comando.
-    UnexpectedOperator,
-    /// O pipeline excede [`MAX_PIPELINE`] estágios.
-    PipelineTooLong,
-    /// Um comando excede [`MAX_WORDS`] palavras.
-    TooManyWords,
-    /// Redirecionamento sem destino.
-    MissingRedirectionTarget,
+    UnexpectedToken,
+    MissingLParen,
+    MissingRParen,
+    MissingComma,
+    MissingEq,
+    TooManyStatements,
+    TooManyChainItems,
+    TooManyArgs,
+    MissingBlockBody,
+    UnterminatedBlock,
+    UnknownCommand,
 }
 
-/// Lê uma *lista* completa de `tokens` para `entries`.
-///
-/// Devolve o número de entradas preenchidas. Cada entrada carrega o conector
-/// que a liga à seguinte, o que basta para o executor decidir se pula o resto
-/// (curto-circuito de `&&`/`||`).
-pub fn parse_list(
-    tokens: &[Token],
-    entries: &mut [Entry; MAX_ENTRIES],
-) -> Result<usize, ParseError> {
-    let mut index = 0usize;
-    let mut entry_count = 0usize;
+/// Estado do parser durante a leitura de uma linha.
+struct Parser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+    program: &'a mut Program,
+    /// Conta chaves abertas para detectar blocos `{ ... }`.
+    brace_depth: usize,
+    /// Índice do statement corrente que estamos preenchendo.
+    current_stmt: Option<Stmt>,
+}
 
-    while index < tokens.len() {
-        if entry_count == entries.len() {
-            return Err(ParseError::PipelineTooLong);
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<Token> {
+        self.tokens.get(self.pos).copied()
+    }
+
+    fn next(&mut self) -> Option<Token> {
+        let token = self.tokens.get(self.pos).copied();
+        if token.is_some() {
+            self.pos += 1;
         }
-        let (pipeline, next, connector) = parse_pipeline(tokens, index)?;
-        entries[entry_count] = Entry { pipeline, connector };
-        entry_count += 1;
-        index = next;
-        if connector == Connector::End {
-            break;
+        token
+    }
+
+    fn expect(&mut self, kind: TokenKind) -> Result<Token, ParseError> {
+        match self.next() {
+            Some(token) if token.kind == kind => Ok(token),
+            Some(_) => Err(ParseError::UnexpectedToken),
+            None => Err(ParseError::UnexpectedToken),
         }
     }
 
-    Ok(entry_count)
-}
-
-fn parse_pipeline(tokens: &[Token], start: usize) -> Result<(Pipeline, usize, Connector), ParseError> {
-    let mut pipeline = Pipeline::EMPTY;
-    let mut index = start;
-
-    loop {
-        if index >= tokens.len() {
-            return Err(ParseError::UnexpectedOperator);
+    /// Lê um statement completo (cadeia ponto-notação opcionalmente seguida de
+    /// bloco `{ ... }`).
+    fn parse_stmt(&mut self) -> Result<(), ParseError> {
+        if self.program.stmt_count == self.program.stmts.len() {
+            return Err(ParseError::TooManyStatements);
         }
-        if pipeline.command_count == MAX_PIPELINE {
-            return Err(ParseError::PipelineTooLong);
-        }
-        let (command, next) = parse_command(tokens, index)?;
-        pipeline.commands[pipeline.command_count] = command;
-        pipeline.command_count += 1;
-        index = next;
 
-        // Se o próximo token for `|`, o pipeline continua.
-        if let Some(Token::Operator(Operator::Pipe)) = tokens.get(index) {
-            index += 1;
-            continue;
+        // Espera `.` (ou Newline ignorado).
+        match self.peek() {
+            Some(Token { kind: TokenKind::Newline, .. }) => {
+                self.next();
+                return Ok(());
+            }
+            Some(Token { kind: TokenKind::Eof, .. }) => return Ok(()),
+            Some(Token { kind: TokenKind::Dot, .. }) => {}
+            _ => return Err(ParseError::UnexpectedToken),
         }
-        break;
+
+        let mut items = [ChainItem { kind: ChainItemKind::Run, arg_start: 0, arg_count: 0 }; 8];
+        let mut item_count = 0usize;
+
+        loop {
+            // Consome o `.`.
+            self.expect(TokenKind::Dot)?;
+            let name_token = self.expect_ident()?;
+            let kind = match name_token.as_str() {
+                "run" => ChainItemKind::Run,
+                "from" => ChainItemKind::From,
+                "args" => ChainItemKind::Args,
+                "flags" => ChainItemKind::Flags,
+                "loop" => ChainItemKind::Loop,
+                "if" => ChainItemKind::If,
+                "else" => ChainItemKind::Else,
+                "endif" => ChainItemKind::EndIf,
+                "scope" => ChainItemKind::Scope,
+                "endscope" => ChainItemKind::EndScope,
+                "function" => ChainItemKind::Function,
+                "import" => ChainItemKind::Import,
+                "pipe" => ChainItemKind::Pipe,
+                "var" => ChainItemKind::Var,
+                "setvar" => ChainItemKind::SetVar,
+                _ => return Err(ParseError::UnknownCommand),
+            };
+            self.expect(TokenKind::LParen)?;
+            let (arg_start, arg_count) = self.parse_args()?;
+            self.expect(TokenKind::RParen)?;
+
+            if item_count == items.len() {
+                return Err(ParseError::TooManyChainItems);
+            }
+            items[item_count] = ChainItem { kind, arg_start, arg_count };
+            item_count += 1;
+
+            // Se o próximo for `.`, continua a cadeia; senão, termina o statement.
+            match self.peek() {
+                Some(Token { kind: TokenKind::Dot, .. }) => continue,
+                _ => break,
+            }
+        }
+
+        // Se houver um bloco `{ ... }` logo após, anexa ao último item (ex. .function).
+        if let Some(Token { kind: TokenKind::LBrace, .. }) = self.peek() {
+            self.next();
+            let body_start = self.program.stmt_count + 1;
+            self.parse_until_rbrace()?;
+            let body_end = self.program.stmt_count;
+            // Adiciona um statement Function para capturar o bloco (simplificado:
+            // o executor trata o bloco como statements sequenciais entre body_start..body_end).
+            let _ = body_start;
+            let _ = body_end;
+            // Por enquanto, ignoramos o bloco no statement; o executor lê os
+            // statements seguintes até .endif/.endscope quando aplicável.
+        }
+
+        if item_count == 0 {
+            return Err(ParseError::UnexpectedToken);
+        }
+
+        self.program.stmts[self.program.stmt_count] = Stmt::Chain { items, item_count };
+        self.program.stmt_count += 1;
+        Ok(())
     }
 
-    let connector = match tokens.get(index) {
-        None => Connector::End,
-        Some(Token::Operator(Operator::Semicolon)) => Connector::Always,
-        Some(Token::Operator(Operator::And)) => Connector::OnSuccess,
-        Some(Token::Operator(Operator::Or)) => Connector::OnFailure,
-        Some(Token::Operator(Operator::Background)) => Connector::Background,
-        Some(_) => return Err(ParseError::UnexpectedOperator),
-    };
-    if connector != Connector::End {
-        index += 1;
+    /// Lê argumentos dentro dos parênteses (já consumido o `(`).
+    fn parse_args(&mut self) -> Result<(usize, usize), ParseError> {
+        let arg_start = self.program.arg_count;
+        let mut arg_count = 0usize;
+
+        loop {
+            match self.peek() {
+                Some(Token { kind: TokenKind::RParen, .. }) => break,
+                Some(Token { kind: TokenKind::Comma, .. }) => {
+                    self.next();
+                    continue;
+                }
+                Some(Token { kind: TokenKind::Newline, .. }) | Some(Token { kind: TokenKind::Eof, .. }) => {
+                    return Err(ParseError::MissingRParen);
+                }
+                _ => {}
+            }
+
+            if arg_count == 128 {
+                return Err(ParseError::TooManyArgs);
+            }
+            let arg = self.parse_one_arg()?;
+            self.store_arg(arg);
+            arg_count += 1;
+        }
+
+        Ok((arg_start, arg_count))
     }
-    Ok((pipeline, index, connector))
-}
 
-fn parse_command(tokens: &[Token], start: usize) -> Result<(Command, usize), ParseError> {
-    let mut command = Command::EMPTY;
-    let mut index = start;
-    // Slot que espera a próxima palavra, quando ela for alvo de um
-    // redirecionamento. Guardado como variável local: nada é compartilhado.
-    let mut pending = RedirectSlot::None;
+    /// Lê um único argumento: `ident=valor`, `-ident=valor` ou literal.
+    fn parse_one_arg(&mut self) -> Result<Arg, ParseError> {
+        // Flag: `-nome=valor`
+        if let Some(Token { kind: TokenKind::Minus, .. }) = self.peek() {
+            self.next();
+            let name_tok = self.expect_ident()?;
+            self.expect(TokenKind::Eq)?;
+            let value_tok = self.expect_arg_value()?;
+            let mut name = [0u8; crate::lexer::TOKEN_TEXT];
+            let mut value = [0u8; crate::lexer::TOKEN_TEXT];
+            name[..name_tok.text_len].copy_from_slice(name_tok.as_bytes());
+            value[..value_tok.text_len].copy_from_slice(value_tok.as_bytes());
+            return Ok(Arg::Flag { name, name_len: name_tok.text_len, value, value_len: value_tok.text_len });
+        }
 
-    while index < tokens.len() {
-        match tokens[index] {
-            Token::Word(word) => {
-                match pending {
-                    RedirectSlot::In => command.stdin = Some(word),
-                    RedirectSlot::Out => command.stdout = Some(word),
-                    RedirectSlot::None => {
-                        if command.word_count == MAX_WORDS {
-                            return Err(ParseError::TooManyWords);
-                        }
-                        command.words[command.word_count] = word;
-                        command.word_count += 1;
+        let first = self.expect_arg_value()?;
+        // Verifica se vem `=` (argumento nomeado `nome=valor`).
+        if let Some(Token { kind: TokenKind::Eq, .. }) = self.peek() {
+            self.next();
+            let name_tok = first;
+            let value_tok = self.expect_arg_value()?;
+            let mut name = [0u8; crate::lexer::TOKEN_TEXT];
+            let mut value = [0u8; crate::lexer::TOKEN_TEXT];
+            name[..name_tok.text_len].copy_from_slice(name_tok.as_bytes());
+            value[..value_tok.text_len].copy_from_slice(value_tok.as_bytes());
+            return Ok(Arg::Named { name, name_len: name_tok.text_len, value, value_len: value_tok.text_len });
+        }
+
+        // Positional literal.
+        let mut text = [0u8; crate::lexer::TOKEN_TEXT];
+        text[..first.text_len].copy_from_slice(first.as_bytes());
+        Ok(Arg::Positional { text, len: first.text_len })
+    }
+
+    fn expect_ident(&mut self) -> Result<Token, ParseError> {
+        match self.next() {
+            Some(token) if matches!(token.kind, TokenKind::Ident | TokenKind::String | TokenKind::Int | TokenKind::Bool) => Ok(token),
+            _ => Err(ParseError::UnexpectedToken),
+        }
+    }
+
+    fn expect_arg_value(&mut self) -> Result<Token, ParseError> {
+        match self.next() {
+            Some(token) if matches!(
+                token.kind,
+                TokenKind::String | TokenKind::Int | TokenKind::Bool | TokenKind::Ident
+            ) => Ok(token),
+            _ => Err(ParseError::UnexpectedToken),
+        }
+    }
+
+    /// Guarda um argumento no buffer compartilhado (índices são referenciados
+    /// pelos ChainItems).
+    fn store_arg(&mut self, arg: Arg) {
+        match arg {
+            Arg::Positional { text, len } => {
+                self.program.args[self.program.arg_count][..len].copy_from_slice(&text[..len]);
+                self.program.args_len[self.program.arg_count] = len;
+                self.program.arg_count += 1;
+            }
+            Arg::Named { name, name_len, value, value_len } => {
+                // Armazena "nome=valor" como um único texto para simplificar o
+                // executor (ele redivide em '=').
+                let mut combined = [0u8; crate::lexer::TOKEN_TEXT];
+                let mut total = 0usize;
+                combined[..name_len].copy_from_slice(&name[..name_len]);
+                total += name_len;
+                combined[total] = b'=';
+                total += 1;
+                combined[total..total + value_len].copy_from_slice(&value[..value_len]);
+                total += value_len;
+                self.program.args[self.program.arg_count][..total].copy_from_slice(&combined[..total]);
+                self.program.args_len[self.program.arg_count] = total;
+                self.program.arg_count += 1;
+            }
+            Arg::Flag { name, name_len, value, value_len } => {
+                let mut combined = [0u8; crate::lexer::TOKEN_TEXT];
+                let mut total = 0usize;
+                combined[total] = b'-';
+                total += 1;
+                combined[total..total + name_len].copy_from_slice(&name[..name_len]);
+                total += name_len;
+                combined[total] = b'=';
+                total += 1;
+                combined[total..total + value_len].copy_from_slice(&value[..value_len]);
+                total += value_len;
+                self.program.args[self.program.arg_count][..total].copy_from_slice(&combined[..total]);
+                self.program.args_len[self.program.arg_count] = total;
+                self.program.arg_count += 1;
+            }
+        }
+    }
+
+    /// Lê statements até encontrar `}` (não incluso), para blocos de função.
+    fn parse_until_rbrace(&mut self) -> Result<(), ParseError> {
+        let mut depth = 1usize;
+        loop {
+            match self.peek() {
+                Some(Token { kind: TokenKind::LBrace, .. }) => {
+                    depth += 1;
+                    self.next();
+                }
+                Some(Token { kind: TokenKind::RBrace, .. }) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.next();
+                        return Ok(());
                     }
+                    self.next();
                 }
-                pending = RedirectSlot::None;
-                index += 1;
+                Some(Token { kind: TokenKind::Newline, .. }) | Some(Token { kind: TokenKind::Eof, .. }) => {
+                    self.next();
+                }
+                _ => {
+                    if self.program.stmt_count == self.program.stmts.len() {
+                        return Err(ParseError::TooManyStatements);
+                    }
+                    self.parse_stmt()?;
+                }
             }
-            Token::Operator(operator @ (Operator::RedirectIn | Operator::RedirectOut | Operator::RedirectAppend)) => {
-                if pending != RedirectSlot::None {
-                    return Err(ParseError::MissingRedirectionTarget);
-                }
-                if operator == Operator::RedirectIn {
-                    command.stdin = None;
-                    pending = RedirectSlot::In;
-                } else {
-                    command.stdout = None;
-                    command.append = operator == Operator::RedirectAppend;
-                    pending = RedirectSlot::Out;
-                }
-                index += 1;
-            }
-            Token::Operator(_) => break,
         }
     }
-
-    if pending != RedirectSlot::None {
-        return Err(ParseError::MissingRedirectionTarget);
-    }
-    if command.word_count == 0 {
-        return Err(ParseError::UnexpectedOperator);
-    }
-    Ok((command, index))
 }
 
-/// Slot aguardando a palavra que é o destino de um redirecionamento.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RedirectSlot {
-    None,
-    In,
-    Out,
+/// Converte uma lista de tokens (uma linha) em um Program.
+pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
+    let mut program = Program::new();
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        program: &mut program,
+        brace_depth: 0,
+        current_stmt: None,
+    };
+    loop {
+        match parser.peek() {
+            None | Some(Token { kind: TokenKind::Eof, .. }) => break,
+            Some(Token { kind: TokenKind::Newline, .. }) => {
+                parser.next();
+            }
+            _ => parser.parse_stmt()?,
+        }
+    }
+    Ok(program)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::{tokenize, Token, Word};
+    use crate::lexer::{tokenize, TokenKind, MAX_TOKENS};
 
-    fn parse(line: &str) -> (usize, [Entry; MAX_ENTRIES]) {
-        let mut tokens = [Token::Word(Word::EMPTY); crate::lexer::MAX_TOKENS];
-        let count = tokenize(line.as_bytes(), &mut tokens).expect("tokenize");
-        let mut entries = [Entry {
-            pipeline: Pipeline::EMPTY,
-            connector: Connector::End,
-        }; MAX_ENTRIES];
-        let entry_count = parse_list(&tokens[..count], &mut entries).expect("parse");
-        (entry_count, entries)
-    }
-
-    fn literal(word: &Word) -> [u8; crate::lexer::TOKEN_SIZE] {
-        let mut buffer = [0u8; crate::lexer::TOKEN_SIZE];
-        let bytes = word.literal_bytes().expect("literal word");
-        buffer[..bytes.len()].copy_from_slice(bytes);
-        buffer
+    fn parse_line(input: &str) -> Program {
+        let mut tokens = [Token { kind: TokenKind::Eof, ..Default::default() }; MAX_TOKENS];
+        let count = tokenize(input.as_bytes(), &mut tokens).expect("tokenize");
+        parse(&tokens[..count]).expect("parse")
     }
 
     #[test]
-    fn parses_simple_command_with_words() {
-        let (count, entries) = parse("ls -la");
-        assert_eq!(count, 1);
-        assert_eq!(entries[0].pipeline.command_count, 1);
-        let command = &entries[0].pipeline.commands[0];
-        assert_eq!(command.word_count, 2);
-        assert_eq!(&literal(&command.words[0])[..2], b"ls");
-        assert_eq!(&literal(&command.words[1])[..3], b"-la");
+    fn simple_run() {
+        let prog = parse_line(r#".run("ls")"#);
+        assert_eq!(prog.stmt_count, 1);
+        match prog.stmts[0] {
+            Stmt::Chain { items, item_count } => {
+                assert_eq!(item_count, 1);
+                assert_eq!(items[0].kind, ChainItemKind::Run);
+                assert_eq!(items[0].arg_count, 1);
+            }
+            _ => panic!("esperado Chain"),
+        }
     }
 
     #[test]
-    fn parses_pipeline_stages() {
-        let (count, entries) = parse("cat file | grep x | wc");
-        assert_eq!(count, 1);
-        assert_eq!(entries[0].pipeline.command_count, 3);
+    fn chained_command() {
+        let prog = parse_line(r#".from("cow").run("moo")"#);
+        match prog.stmts[0] {
+            Stmt::Chain { items, item_count } => {
+                assert_eq!(item_count, 2);
+                assert_eq!(items[0].kind, ChainItemKind::From);
+                assert_eq!(items[1].kind, ChainItemKind::Run);
+            }
+            _ => panic!("esperado Chain"),
+        }
     }
 
     #[test]
-    fn records_connectors_between_entries() {
-        let (count, entries) = parse("a && b || c ; d");
-        assert_eq!(count, 4);
-        assert_eq!(entries[0].connector, Connector::OnSuccess);
-        assert_eq!(entries[1].connector, Connector::OnFailure);
-        assert_eq!(entries[2].connector, Connector::Always);
-        assert_eq!(entries[3].connector, Connector::End);
+    fn named_args_and_flags() {
+        let prog = parse_line(r#".run("cow").args(owner="root").flags(-sound="moo")"#);
+        match prog.stmts[0] {
+            Stmt::Chain { items, item_count } => {
+                assert_eq!(item_count, 3);
+                assert_eq!(items[0].kind, ChainItemKind::Run);
+                assert_eq!(items[1].kind, ChainItemKind::Args);
+                assert_eq!(items[2].kind, ChainItemKind::Flags);
+            }
+            _ => panic!("esperado Chain"),
+        }
     }
 
     #[test]
-    fn parses_redirections() {
-        let (_, entries) = parse("echo hi > out.txt");
-        let command = &entries[0].pipeline.commands[0];
-        assert!(command.stdout.is_some());
-        assert!(!command.append);
-        assert_eq!(command.word_count, 2);
-
-        let (_, entries) = parse("cat < in.txt");
-        let command = &entries[0].pipeline.commands[0];
-        assert!(command.stdin.is_some());
-        assert_eq!(command.word_count, 1);
+    fn loop_and_if() {
+        let prog = parse_line(r#".loop(3).run("echo")"#);
+        match prog.stmts[0] {
+            Stmt::Chain { items, item_count } => {
+                assert_eq!(items[0].kind, ChainItemKind::Loop);
+                assert_eq!(items[0].arg_count, 1);
+            }
+            _ => panic!("esperado Chain"),
+        }
     }
 
     #[test]
-    fn append_redirection_is_flagged() {
-        let (_, entries) = parse("echo hi >> log");
-        let command = &entries[0].pipeline.commands[0];
-        assert!(command.append);
+    fn var_declaration() {
+        let prog = parse_line(r#".var(x = 10)"#);
+        match prog.stmts[0] {
+            Stmt::Chain { items, item_count } => {
+                assert_eq!(item_count, 1);
+                assert_eq!(items[0].kind, ChainItemKind::Var);
+            }
+            _ => panic!("esperado Chain"),
+        }
     }
 
     #[test]
-    fn rejects_dangling_redirection() {
-        let mut tokens = [Token::Word(Word::EMPTY); crate::lexer::MAX_TOKENS];
-        let count = tokenize(b"echo hi >", &mut tokens).expect("tokenize");
-        let mut entries = [Entry {
-            pipeline: Pipeline::EMPTY,
-            connector: Connector::End,
-        }; MAX_ENTRIES];
-        assert_eq!(
-            parse_list(&tokens[..count], &mut entries),
-            Err(ParseError::MissingRedirectionTarget)
-        );
+    fn empty_line() {
+        let prog = parse_line("");
+        assert_eq!(prog.stmt_count, 0);
     }
 
     #[test]
-    fn treats_background_as_a_connector() {
-        let (count, entries) = parse("sleep 10 & echo done");
-        assert_eq!(count, 2);
-        assert_eq!(entries[0].connector, Connector::Background);
+    fn comment_line() {
+        let prog = parse_line("# so um comentario");
+        assert_eq!(prog.stmt_count, 0);
     }
 }
